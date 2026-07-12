@@ -13,64 +13,91 @@ const UNIT_TO_ML = {
   tsp: 5,
   teaspoon: 5,
   teaspoons: 5,
-  oz: 0,
-  ounce: 0,
-  ounces: 0,
-  lb: 0,
-  pound: 0,
-  pounds: 0
+  oz: 28.35,
+  ounce: 28.35,
+  ounces: 28.35,
+  lb: 453.59,
+  pound: 453.59,
+  pounds: 453.59
 };
 
-function toGrams(quantity, unit, ingredient) {
-  const baseUnit = unit?.toLowerCase();
-  if (!ingredient) {
-    return quantity * (UNIT_TO_ML[baseUnit] || 0);
-  }
+function normalizeUnit(unit) {
+  return String(unit || '').trim().toLowerCase();
+}
+
+export function convertToGrams(quantity, unit, ingredient = {}) {
+  const amount = Number(quantity) || 0;
+  const baseUnit = normalizeUnit(unit);
 
   if (baseUnit === 'g' || baseUnit === 'gram' || baseUnit === 'grams') {
-    return quantity;
+    return amount;
   }
 
   if (baseUnit === 'oz' || baseUnit === 'ounce' || baseUnit === 'ounces') {
-    return quantity * 28.35;
+    return amount * 28.35;
   }
 
   if (baseUnit === 'lb' || baseUnit === 'pound' || baseUnit === 'pounds') {
-    return quantity * 453.59;
-  }
-
-  if (baseUnit === 'ml' || baseUnit === 'milliliter' || baseUnit === 'milliliters') {
-    return quantity * (ingredient.density || 1);
+    return amount * 453.59;
   }
 
   const mlEquivalent = UNIT_TO_ML[baseUnit] || 0;
-  return quantity * mlEquivalent * (ingredient.density || 1);
+  if (mlEquivalent === 0) {
+    return amount;
+  }
+
+  return amount * mlEquivalent * (Number(ingredient.density) || 1);
+}
+
+export function convertGramsToUnit(grams, unit = 'g', ingredient = {}) {
+  const amount = Number(grams) || 0;
+  const baseUnit = normalizeUnit(unit);
+
+  if (baseUnit === 'g' || baseUnit === 'gram' || baseUnit === 'grams') {
+    return amount;
+  }
+
+  if (baseUnit === 'oz' || baseUnit === 'ounce' || baseUnit === 'ounces') {
+    return amount / 28.35;
+  }
+
+  if (baseUnit === 'lb' || baseUnit === 'pound' || baseUnit === 'pounds') {
+    return amount / 453.59;
+  }
+
+  const mlEquivalent = UNIT_TO_ML[baseUnit] || 0;
+  if (mlEquivalent === 0) {
+    return amount;
+  }
+
+  return amount / ((Number(ingredient.density) || 1) * mlEquivalent);
 }
 
 export function calculateScaledIngredients(recipe, targetYield) {
   const baseYield = Number(recipe.baseYield || 1);
-  const scale = baseYield > 0 ? targetYield / baseYield : 1;
+  const scale = baseYield > 0 ? Number(targetYield || baseYield) / baseYield : 1;
 
-  return (recipe.ingredients || []).map((ingredientLine) => ({
-    ...ingredientLine,
-    quantity: Number(ingredientLine.quantity || 0) * scale
-  }));
+  return (recipe.ingredients || []).map((item) => {
+    const ingredient = item.ingredient || {};
+    const grams = Number(item.grams ?? convertToGrams(item.quantity ?? 0, item.unit ?? 'g', ingredient)) || 0;
+    return {
+      ...item,
+      grams,
+      scaledGrams: grams * scale,
+      quantity: item.quantity != null ? Number((Number(item.quantity || 0) * scale).toFixed(2)) : undefined
+    };
+  });
 }
 
 export function calculateRecipeNutrition(recipe, targetYield = recipe.baseYield || 1) {
   const scaledIngredients = calculateScaledIngredients(recipe, targetYield);
-  const grams = scaledIngredients.reduce((total, item) => {
-    const ingredient = item.ingredient || null;
-    return total + toGrams(item.quantity, item.unit, ingredient);
-  }, 0);
 
+  const grams = scaledIngredients.reduce((total, item) => total + Number(item.scaledGrams || 0), 0);
   const calories = Number(scaledIngredients.reduce((total, item) => {
-    const ingredient = item.ingredient || null;
-    const gramsForItem = toGrams(item.quantity, item.unit, ingredient);
-    return total + gramsForItem * (ingredient?.caloriesPerGram || 0);
+    return total + Number(item.scaledGrams || 0) * (Number(item.ingredient?.caloriesPerGram) || 0);
   }, 0).toFixed(0));
 
-  const perServing = targetYield > 0 ? Math.round(calories / targetYield) : calories;
+  const perServing = targetYield > 0 ? Math.round(calories / Number(targetYield)) : calories;
 
   return {
     grams,
@@ -81,27 +108,17 @@ export function calculateRecipeNutrition(recipe, targetYield = recipe.baseYield 
 }
 
 export function convertIngredientUnits(recipe, targetUnit) {
-  const normalizedTarget = targetUnit?.toString().toLowerCase();
+  const normalizedTarget = normalizeUnit(targetUnit);
   if (!normalizedTarget) {
-    return recipe;
-  }
-
-  const targetMl = UNIT_TO_ML[normalizedTarget] ?? 0;
-  if (targetMl <= 0) {
     return recipe;
   }
 
   return {
     ...recipe,
-    ingredients: (recipe.ingredients || []).map((item) => {
-      const ingredient = item.ingredient || null;
-      const grams = toGrams(item.quantity, item.unit, ingredient);
-      const convertedQuantity = grams / (ingredient?.density || 1) / targetMl;
-      return {
-        ...item,
-        quantity: Number(convertedQuantity.toFixed(2)),
-        unit: normalizedTarget
-      };
-    })
+    ingredients: (recipe.ingredients || []).map((item) => ({
+      ...item,
+      displayUnit: normalizedTarget,
+      displayQuantity: Number(convertGramsToUnit(Number(item.grams || 0), normalizedTarget, item.ingredient).toFixed(2))
+    }))
   };
 }
