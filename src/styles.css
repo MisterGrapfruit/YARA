@@ -15,7 +15,28 @@ header { margin-bottom: 24px; }
 .card { background: white; border-radius: 16px; padding: 20px; box-shadow: 0 10px 35px rgba(0,0,0,.06); margin-bottom: 20px; }
 .grid { display: grid; gap: 20px; grid-template-columns: 1.1fr 0.9fr; }
 .settings-grid { display: grid; gap: 20px; grid-template-columns: repeat(2, minmax(280px, 1fr)); }
+.recipe-tab-layout { display: grid; gap: 20px; grid-template-columns: 280px 1fr; }
+.folder-column { padding: 18px; }
+.folder-sidebar { display: grid; gap: 12px; }
+.folder-filter, .folder-drop-target > .folder-filter { width: 100%; text-align: left; background: #f4fbf4; border: 1px solid #d6e7d6; padding: 10px 14px; border-radius: 12px; cursor: pointer; color: #2f8f4d; }
+.folder-filter.active, .folder-drop-target.active > .folder-filter { background: #def2dd; border-color: #8fde94; }
+.folder-drop-target.drag-over > .folder-filter { border-color: #2f8f4d; background: #e9f8ea; }
+.recipe-column { display: grid; gap: 20px; }
 .recipe-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.recipe-card { border: 1px solid #e2eddf; border-radius: 16px; padding: 18px; background: #fff; cursor: pointer; transition: transform .2s ease, box-shadow .2s ease; }
+.recipe-card:hover { transform: translateY(-2px); box-shadow: 0 16px 30px rgba(0,0,0,.08); }
+.recipe-card.dragging { opacity: 0.5; }
+.detail-view button { margin-bottom: 16px; }
+.recipe-detail-layout { display: grid; gap: 20px; grid-template-columns: 280px 1fr; }
+.detail-sidebar { position: sticky; top: 24px; }
+.detail-main { padding: 24px; }
+.ingredient-row { display: grid; gap: 10px; padding: 14px; border: 1px solid #e9edf4; border-radius: 14px; margin-bottom: 12px; background: #fbfdf9; }
+.ingredient-row input, .ingredient-row select { width: 100%; }
+.detail-main form > .row { justify-content: flex-start; }
+@media (max-width: 960px) {
+  .recipe-tab-layout, .recipe-detail-layout { grid-template-columns: 1fr; }
+  .folder-column, .detail-sidebar { position: static; }
+}
 .section-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 20px; }
 .header-row { justify-content: space-between; align-items: flex-start; }
 .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }

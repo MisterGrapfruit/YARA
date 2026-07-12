@@ -79,3 +79,29 @@ export function calculateRecipeNutrition(recipe, targetYield = recipe.baseYield 
     scaledIngredients
   };
 }
+
+export function convertIngredientUnits(recipe, targetUnit) {
+  const normalizedTarget = targetUnit?.toString().toLowerCase();
+  if (!normalizedTarget) {
+    return recipe;
+  }
+
+  const targetMl = UNIT_TO_ML[normalizedTarget] ?? 0;
+  if (targetMl <= 0) {
+    return recipe;
+  }
+
+  return {
+    ...recipe,
+    ingredients: (recipe.ingredients || []).map((item) => {
+      const ingredient = item.ingredient || null;
+      const grams = toGrams(item.quantity, item.unit, ingredient);
+      const convertedQuantity = grams / (ingredient?.density || 1) / targetMl;
+      return {
+        ...item,
+        quantity: Number(convertedQuantity.toFixed(2)),
+        unit: normalizedTarget
+      };
+    })
+  };
+}
