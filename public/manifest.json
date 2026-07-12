@@ -1,0 +1,10 @@
+{
+  "name": "Recipe & Meal Planner",
+  "short_name": "RecipeApp",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#f4f7fb",
+  "theme_color": "#2f6fed",
+  "icons": []
+}

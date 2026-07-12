@@ -1,0 +1,132 @@
+# Recipe & Meal Planning App — Project Spec
+
+## Overview
+A personal/family recipe manager and meal planner, built as a Progressive Web App (PWA), similar in spirit to Paprika but with structured ingredient-level nutrition math (calorie/density-based conversions) and calendar-driven shopping lists.
+
+## Format & Hosting
+- **Format:** PWA — plain HTML/JS/CSS (no build-heavy framework required, but React is fine if useful for state management). Installable to home screen on tablet/phone/desktop. Works on tablet, desktop, and laptop browsers.
+- **Architecture:** Fully client-side / static. No backend server, no custom database. All persistent data lives in Google Drive + Google Calendar; the app is just code that runs in the browser and calls Google's APIs directly.
+- **Hosting:** GitHub Pages, deployed from a GitHub repo (user already uses GitHub for other projects). URL will be `https://<username>.github.io/<repo-name>/`. Pages will be enabled once there is deployable content.
+- **Offline support:** **Essential requirement.** Implemented via:
+  - Service worker caching the app shell (HTML/JS/CSS) for full offline load
+  - IndexedDB as a local cache/source-of-truth for recipes, ingredients, and unit data
+  - All reads/writes hit the local IndexedDB cache instantly; background sync pushes to Google Drive when a connection is available
+  - Conflict handling: last-edit-wins by timestamp, but flag/warn the user if two devices modified the same recipe while both were offline, rather than silently overwriting
+
+## Tech Stack
+- **Build tool:** Vite (fast local dev server, straightforward static build for GitHub Pages)
+- **UI:** Plain JS modules — no heavy framework. App complexity lives in the data/logic layer (scaling, conversion, sync), not the UI, so a framework isn't required. Can revisit in favor of a lightweight component library later if the UI grows unwieldy.
+
+## File Scaffold
+```
+recipe-app/
+├── index.html                  # entry HTML, links manifest + main.js
+├── package.json
+├── vite.config.js
+├── public/
+│   ├── manifest.json           # PWA manifest (name, icons, theme)
+│   └── icons/                  # home-screen icons, various sizes
+├── src/
+│   ├── main.js                 # app entry point, router init
+│   ├── sw.js                   # service worker (offline app-shell caching)
+│   │
+│   ├── auth/
+│   │   └── googleAuth.js       # OAuth PKCE flow, token storage/refresh
+│   │
+│   ├── api/
+│   │   ├── driveClient.js      # Drive read/write calls (drive.file scope)
+│   │   └── calendarClient.js   # Calendar events + extended properties
+│   │
+│   ├── data/
+│   │   ├── db.js               # IndexedDB wrapper (local source of truth)
+│   │   ├── syncEngine.js       # background sync to Drive, conflict flagging
+│   │   └── schema.js           # schema.org/Recipe mapping (import/export)
+│   │
+│   ├── models/
+│   │   ├── Recipe.js           # scaling math, calorie/unit calc, variations
+│   │   ├── Ingredient.js       # density, calories/gram, custom units
+│   │   └── Unit.js             # global + per-ingredient unit conversion
+│   │
+│   ├── features/
+│   │   ├── recipes/            # list/detail/edit views, category sort
+│   │   ├── ingredients/        # ingredient library management UI
+│   │   ├── units/              # custom unit editor (e.g. "large can")
+│   │   ├── calendar/           # meal-plan calendar view
+│   │   ├── shopping-list/      # date-range aggregation, aisle grouping
+│   │   └── cook-mode/          # keep-awake, checkable steps
+│   │
+│   ├── components/             # shared UI bits (recipe card, scale slider…)
+│   └── utils/
+│       ├── unitConversion.js
+│       └── nutritionCalc.js
+│
+├── scraper-utility/             # separate, not part of the deployed app
+│   └── scrape_recipe.py         # uses recipe-scrapers, outputs schema.org JSON
+│
+└── recipe-app-spec.md
+```
+**Design notes:**
+- `data/` (where things are stored — IndexedDB, sync, Drive I/O) is kept separate from `models/` (the math/rules — scaling, conversion, calorie calc), so the scaling/conversion logic is testable without touching network or browser storage.
+- `scraper-utility/` sits outside `src/` and isn't part of the deployed app — a standalone script run locally to pull in a recipe, review it, then save the output into the app.
+
+## Auth & Accounts
+- **Google OAuth**, PKCE flow (no client secret — appropriate for a static/client-side app, nothing to protect a secret with anyway)
+- **Scopes:** `drive.file` (app only sees files it creates — narrow, no full-Drive access) and `calendar.events` (read/write events, not full calendar settings)
+- Google Cloud project, OAuth consent screen, and client ID are **already set up** by the user. Consent screen is in "Testing" mode (fine for personal/family use — no Google app review needed, but limited to added test users, tokens expire ~7 days without re-auth).
+- **Account model:** Single shared login used by all family members (decided over "everyone uses their own account" — avoids Drive sharing/scope complications). Currently testing with the user's personal Google account; can be switched to a dedicated household account later by (1) adding the new account as a test user in the OAuth consent screen, (2) transferring Drive folder ownership to the new account, (3) sharing/recreating Calendar events, (4) logging in with the new account on all devices. No code changes required for this switch.
+
+## Data Model
+
+### Ingredients library (separate collection)
+Canonical list of ingredients, each with:
+- Name
+- Calories per gram
+- Density (g/mL) — enables volume ↔ mass conversion
+- Any custom units specific to that ingredient/product (e.g. "1 large can black beans = 439g")
+
+### Global unit definitions
+- Standard conversions (cups ↔ mL, oz ↔ g, etc.)
+- User-editable custom units (global or per-ingredient, per the "large can" use case)
+
+### Recipes
+- Reference ingredients by ID + quantity + unit (never duplicate nutrition data inline)
+- Support for **ingredient-only recipes** (no instructions — just a list + quantities; same data model, instructions field empty/absent, type flag distinguishes display)
+- Base yield/serving count, used for live scaling (target yield ÷ base yield = scale factor applied to every ingredient quantity)
+- Calories per unit = sum(ingredient grams × cal/gram) ÷ yield count
+- Categories/tags for sorting and organization
+- Compatible with **schema.org/Recipe** format for import/export and scraper interoperability, extended with structured ingredient references (schema.org stores ingredients as free text; this app parses/stores them as structured `{ingredientId, quantity, unit, prepNote}`)
+
+### Variations
+- Stored as **overlays/diffs** on a base recipe (not full duplicate copies) — e.g. "egg substitution" variation stores only the swapped/adjusted ingredients, referencing the base recipe for everything else
+- Displayed within the same recipe "card"/tab, toggleable
+
+### Recipe ingestion / scraping
+- Not built into the main app. Planned as a **separate small utility** using the existing `recipe-scrapers` Python library, which already parses schema.org JSON-LD from AllRecipes and hundreds of other sites — paste a URL, review the structured result, save into the app's Drive-based recipe store.
+
+## Meal Planning (Calendar)
+- Google Calendar events reference a recipe via **extended properties** (invisible metadata on the event, not shown in the description) storing recipe ID + planned scale/servings
+- Selecting a date range aggregates all planned recipes in that range, scales each by its planned servings, sums matching ingredients across recipes, and produces one shopping list
+- Shopping list grouped by category/aisle (inspired by Paprika's aisle-grouped grocery list)
+
+## Additional features (pulled from Paprika comparison)
+- **Cook mode:** keep-awake screen (Wake Lock API), checkable ingredient list, current-step highlighting while cooking
+- Categorization/sub-categorization of recipes, with search by name/ingredient
+
+## Explicitly deferred / out of scope for v1
+- Pantry inventory tracking with expiration dates (Paprika has this; not requested, could be a future add given the ingredient data model already supports it)
+- "Search by ingredients on hand" recipe discovery
+- Multi-account Drive sharing (Option B from auth discussion) — only relevant if the shared-login approach is revisited later
+
+## Setup status (as of last check-in)
+- [x] Google Cloud project created
+- [x] Drive API + Calendar API enabled
+- [x] OAuth consent screen configured (Testing mode)
+- [x] OAuth client ID created, redirect URI set
+- [x] Test user added (user's personal account)
+- [x] Scopes set (`drive.file`, `calendar.events`)
+- [ ] GitHub repo created
+- [ ] GitHub Pages enabled (pending deployable content)
+- [x] Claude Code CLI installed (v2.1.207)
+- [x] File scaffold planned (see above)
+- [ ] App scaffolding started (project not yet initialized on disk)
+- [ ] Gemini CLI installed as free alternative (npm install in progress)
