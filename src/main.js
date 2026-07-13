@@ -1,876 +1,226 @@
 import './styles.css';
-import {
-  calculateRecipeNutrition,
-  calculateScaledIngredients,
-  convertGramsToUnit,
-  convertToGrams
-} from './models/Recipe.js';
-import {
-  signIn,
-  handleRedirectCallback,
-  getIdTokenClaims,
-  signOut
-} from './auth/googleAuth.js';
-import { syncRecipesToDrive } from './api/googleDrive.js';
-import { createMealEvent, listUpcomingEvents } from './api/googleCalendar.js';
+import { loadDatabaseState, saveDatabaseState } from './data/db.js';
+import { recipeFromSchema, recipeToSchema } from './data/schema.js';
+import { BUILTIN_UNITS, allUnits, applyVariant, calculateRecipeNutrition, convertGramsToUnit, convertToGrams, formatNumber, recipeYield } from './models/Recipe.js';
 
-const STORAGE_KEY = 'recipe-app-state-v2';
-const GOOGLE_CLIENT_ID = '765539968846-4pn21vj4s0225gutensmpiq4nj0s6tmh.apps.googleusercontent.com';
-const GOOGLE_SCOPES = [
-  'openid',
-  'email',
-  'profile',
-  'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/calendar.events'
-].join(' ');
-const REDIRECT_URI = `${window.location.origin}${import.meta.env.BASE_URL}`;
+const app = document.querySelector('#app');
+const now = () => new Date().toISOString();
+const id = () => crypto.randomUUID();
+const ui = { quickIngredientFor: null, quickAliasFor: null, quickUnitFor: null };
 
-const initialState = {
-  recipes: [
-    {
-      id: crypto.randomUUID(),
-      title: 'Simple Bean Bowl',
-      category: 'Dinner',
-      baseYield: 2,
-      instructions: 'Cook beans, combine rice, and serve with a squeeze of lime.',
-      folderId: 'folder-unsorted',
-      ingredients: [
-        {
-          id: crypto.randomUUID(),
-          ingredientId: 'ing-beans',
-          name: 'Black beans',
-          grams: 240,
-          displayUnit: 'cup',
-          ingredient: {
-            name: 'Black beans',
-            caloriesPerGram: 0.34,
-            density: 1.0
-          }
-        },
-        {
-          id: crypto.randomUUID(),
-          ingredientId: 'ing-rice',
-          name: 'Rice',
-          grams: 180,
-          displayUnit: 'cup',
-          ingredient: {
-            name: 'Rice',
-            caloriesPerGram: 0.36,
-            density: 0.8
-          }
-        }
-      ]
-    }
-  ],
-  plan: [],
-  folders: [{ id: 'folder-unsorted', name: 'Unsorted' }],
+const seed = {
+  version: 1,
   ingredients: [
-    { id: 'ing-beans', name: 'Black beans', aliases: ['chickpeas'], caloriesPerGram: 0.34, density: 1.0 },
-    { id: 'ing-rice', name: 'Rice', aliases: ['white rice'], caloriesPerGram: 0.36, density: 0.8 }
+    { id: 'black-beans', name: 'Black beans', aliases: ['black bean'], caloriesPerGram: 1.32, densityGPerMl: 0.73 },
+    { id: 'rice', name: 'Rice, cooked', aliases: ['white rice'], caloriesPerGram: 1.30, densityGPerMl: 0.66 },
+    { id: 'egg', name: 'Egg', aliases: ['large egg'], caloriesPerGram: 1.43, densityGPerMl: 1.03 },
+    { id: 'chickpeas', name: 'Chickpeas', aliases: ['garbanzo beans'], caloriesPerGram: 1.64, densityGPerMl: 0.80 }
   ],
-  measurements: [
-    { id: 'm-g', name: 'g', ml: 1 },
-    { id: 'm-ml', name: 'ml', ml: 1 },
-    { id: 'm-cup', name: 'cup', ml: 240 },
-    { id: 'm-tbsp', name: 'tbsp', ml: 15 },
-    { id: 'm-tsp', name: 'tsp', ml: 5 },
-    { id: 'm-oz', name: 'oz', ml: 29.57 },
-    { id: 'm-lb', name: 'lb', ml: 453.59 }
-  ],
-  driveFolders: {
-    root: null,
-    ingredients: null,
-    measurements: null,
-    recipes: null
-  },
-  driveStatus: 'not-synced',
-  selectedTab: 'recipes',
-  selectedFolderId: 'all',
-  selectedRecipeId: null,
-  selectedRecipeScale: 2,
-  calendarEvents: []
+  customUnits: [{ id: 'large-can', name: 'large can', kind: 'mass', grams: 439, description: 'Drained large can of beans' }],
+  recipes: [{
+    id: 'bean-bowl', title: 'Simple bean bowl', category: 'Dinner', tags: ['quick', 'vegetarian'], description: 'A small starter recipe that demonstrates grams-first scaling.',
+    yield: { amount: 2, unit: 'servings' },
+    instructions: ['Warm the beans and rice.', 'Divide between bowls and season to taste.'],
+    ingredients: [
+      { id: 'beans-line', ingredientId: 'black-beans', grams: 240, displayUnit: 'cup', note: 'drained' },
+      { id: 'rice-line', ingredientId: 'rice', grams: 180, displayUnit: 'cup', note: '' }
+    ],
+    variants: [{ id: 'chickpea-variant', name: 'Chickpea variation', description: 'Swap the beans for chickpeas.', changes: [{ type: 'replace', baseLineId: 'beans-line', line: { ingredientId: 'chickpeas', grams: 240, displayUnit: 'cup', note: 'drained' } }] }],
+    createdAt: now(), updatedAt: now()
+  }],
+  view: 'recipes', selectedRecipeId: 'bean-bowl', selectedVariantId: '', scaleTarget: 2
 };
 
-function normalizeUnit(unit) {
-  return unit?.toString().trim().toLowerCase() || 'g';
+let state = structuredClone(seed);
+
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
 
-function escapeHtml(value) {
-  return String(value || '').replace(/[&<>"']/g, (match) => {
-    return {
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#39;'
-    }[match];
-  });
+function recipeById(recipeId = state.selectedRecipeId) { return state.recipes.find((recipe) => recipe.id === recipeId); }
+function ingredientById(ingredientId) { return state.ingredients.find((ingredient) => ingredient.id === ingredientId); }
+function ingredientMap() { return new Map(state.ingredients.map((ingredient) => [ingredient.id, ingredient])); }
+function unitLabel(unit) { return unit?.name || unit?.id || 'unit'; }
+function selectedRecipe() { return recipeById() || state.recipes[0]; }
+
+async function commit(next) {
+  state = { ...next, updatedAt: now() };
+  await saveDatabaseState(state);
+  render();
 }
 
-function formatDate(dateString) {
-  try {
-    return new Date(dateString).toLocaleDateString();
-  } catch {
-    return dateString;
-  }
+function updateRecipe(recipeId, updater) {
+  return commit({ ...state, recipes: state.recipes.map((recipe) => recipe.id === recipeId ? { ...updater(recipe), updatedAt: now() } : recipe) });
 }
 
-function prepareIngredientLine(item) {
-  return {
-    ...item,
-    grams: item.grams ?? convertToGrams(item.quantity ?? 0, item.unit ?? 'g', item.ingredient || {}),
-    displayUnit: item.displayUnit || item.unit || 'g',
-    ingredient: item.ingredient || { name: item.name, caloriesPerGram: 0, density: 1 }
+function setView(view) { commit({ ...state, view, selectedVariantId: '' }); }
+
+function unitOptions(selected, ingredient) {
+  return allUnits(state.customUnits, ingredient).map((unit) => `<option value="${escapeHtml(unit.id)}"${unit.id === selected ? ' selected' : ''}>${escapeHtml(unitLabel(unit))}</option>`).join('');
+}
+
+function ingredientOptions(selected) {
+  return `<option value="">Choose an ingredient</option>${state.ingredients.map((ingredient) => `<option value="${ingredient.id}"${ingredient.id === selected ? ' selected' : ''}>${escapeHtml(ingredient.name)}${ingredient.aliases?.length ? ` — ${escapeHtml(ingredient.aliases.join(', '))}` : ''}</option>`).join('')}`;
+}
+
+function lineEditor(line, { recipeId, variantId = '', baseLineId = line.id, isVariant = false } = {}) {
+  const ingredient = ingredientById(line.ingredientId) || {};
+  const amount = convertGramsToUnit(line.grams || 0, line.displayUnit || 'g', ingredient, state.customUnits);
+  const densityMessage = !ingredient.densityGPerMl && ['volume', ''].includes((allUnits(state.customUnits, ingredient).find((unit) => unit.id === line.displayUnit) || {}).kind) ? 'Add density to convert volume.' : '';
+  const target = isVariant ? `data-variant-id="${variantId}" data-base-line-id="${baseLineId}"` : `data-line-id="${line.id}"`;
+  return `
+    <div class="ingredient-line" ${target}>
+      <select data-field="ingredientId" aria-label="Ingredient">${ingredientOptions(line.ingredientId)}</select>
+      <div class="quantity-control">
+        <input data-field="quantity" aria-label="Quantity" type="number" min="0" step="any" value="${escapeHtml(amount.toFixed(3).replace(/\.0+$/, ''))}" />
+        <select data-field="displayUnit" aria-label="Unit">${unitOptions(line.displayUnit || 'g', ingredient)}</select>
+      </div>
+      <input data-field="note" aria-label="Ingredient note" value="${escapeHtml(line.note || '')}" placeholder="optional note" />
+      <div class="line-meta"><span>${formatNumber(line.grams)} g canonical</span><span>${formatNumber((line.grams || 0) * (ingredient.caloriesPerGram || 0), 0)} kcal</span>${densityMessage ? `<span class="warning">${densityMessage}</span>` : ''}</div>
+      <div class="line-actions">
+        <button class="text-button" type="button" data-action="quick-ingredient" data-line-id="${baseLineId}" data-variant-id="${variantId}">New ingredient</button>
+        ${line.ingredientId ? `<button class="text-button" type="button" data-action="quick-alias" data-line-id="${baseLineId}" data-variant-id="${variantId}">Add alias</button>` : ''}
+        <button class="text-button" type="button" data-action="quick-unit" data-line-id="${baseLineId}" data-variant-id="${variantId}">New unit</button>
+        <button class="text-button danger-text" type="button" data-action="${isVariant ? 'delete-variant-change' : 'delete-line'}" data-line-id="${baseLineId}" data-variant-id="${variantId}">Remove</button>
+      </div>
+      ${renderQuickForms(baseLineId, variantId)}
+    </div>`;
+}
+
+function renderQuickForms(lineId, variantId) {
+  const key = `${variantId}:${lineId}`;
+  const forms = [];
+  if (ui.quickIngredientFor === key) forms.push(`<form class="quick-form" data-form="quick-ingredient" data-line-id="${lineId}" data-variant-id="${variantId}"><strong>Create ingredient and link it</strong><input name="name" required placeholder="Name (e.g. chickpeas)" /><div class="two-up"><label>kcal / g<input name="caloriesPerGram" type="number" min="0" step="any" value="0" /></label><label>density g / mL<input name="densityGPerMl" type="number" min="0" step="any" value="1" /></label></div><button class="small-button" type="submit">Create & link</button></form>`);
+  if (ui.quickAliasFor === key) forms.push(`<form class="quick-form" data-form="quick-alias" data-line-id="${lineId}" data-variant-id="${variantId}"><strong>Add an alternate name</strong><input name="alias" required placeholder="e.g. garbanzo beans" /><button class="small-button" type="submit">Save alias</button></form>`);
+  if (ui.quickUnitFor === key) forms.push(`<form class="quick-form" data-form="quick-unit" data-line-id="${lineId}" data-variant-id="${variantId}"><strong>Create a reusable custom unit</strong><input name="name" required placeholder="e.g. large can" /><div class="two-up"><label>Kind<select name="kind"><option value="mass">Mass</option><option value="volume">Volume</option></select></label><label>Equivalent<input name="amount" required type="number" min="0.001" step="any" value="1" /></label></div><button class="small-button" type="submit">Create & use</button></form>`);
+  return forms.join('');
+}
+
+function renderRecipeEditor() {
+  const recipe = selectedRecipe();
+  if (!recipe) return '<section class="empty-panel"><h2>No recipes yet</h2><p>Create one to start building your library.</p></section>';
+  const activeVariant = recipe.variants?.find((variant) => variant.id === state.selectedVariantId);
+  const effective = applyVariant(recipe, activeVariant?.id);
+  const nutrition = calculateRecipeNutrition(effective, state.scaleTarget || recipeYield(recipe), state.customUnits, ingredientMap());
+  return `<section class="workspace">
+    <aside class="recipe-list panel">
+      <div class="panel-heading"><div><p class="eyebrow">Library</p><h2>Recipes</h2></div><button class="icon-button" type="button" data-action="new-recipe" title="New recipe">+</button></div>
+      <input id="recipe-filter" class="search" placeholder="Filter recipes" aria-label="Filter recipes" />
+      <div class="recipe-cards">${state.recipes.map((item) => { const cardNutrition = calculateRecipeNutrition(item, recipeYield(item), state.customUnits, ingredientMap()); return `<button class="recipe-card${item.id === recipe.id ? ' selected' : ''}" data-action="select-recipe" data-recipe-id="${item.id}"><span>${escapeHtml(item.category || 'Unsorted')}</span><strong>${escapeHtml(item.title)}</strong><small>${recipeYield(item)} servings · ${cardNutrition.perServing} kcal each</small></button>`; }).join('')}</div>
+    </aside>
+    <main class="recipe-editor panel">
+      <form data-form="recipe" data-recipe-id="${recipe.id}">
+        <div class="editor-title"><div><p class="eyebrow">${activeVariant ? 'Variant preview' : 'Base recipe'}</p><input name="title" class="title-input" value="${escapeHtml(recipe.title)}" placeholder="Recipe name" ${activeVariant ? 'disabled' : ''}/></div><button class="danger-outline" type="button" data-action="delete-recipe" data-recipe-id="${recipe.id}">Delete</button></div>
+        <div class="recipe-fields"><label>Category<input name="category" value="${escapeHtml(recipe.category || '')}" placeholder="Dinner" ${activeVariant ? 'disabled' : ''}/></label><label>Tags<input name="tags" value="${escapeHtml((recipe.tags || []).join(', '))}" placeholder="quick, vegetarian" ${activeVariant ? 'disabled' : ''}/></label><label>Yield<input name="yield" type="number" min="0.1" step="any" value="${recipeYield(recipe)}" ${activeVariant ? 'disabled' : ''}/></label><label>Yield unit<input name="yieldUnit" value="${escapeHtml(recipe.yield?.unit || 'servings')}" ${activeVariant ? 'disabled' : ''}/></label></div>
+        ${!activeVariant ? `<label class="description-field">Description<textarea name="description" placeholder="A note about this recipe">${escapeHtml(recipe.description || '')}</textarea></label>` : `<div class="variant-note"><strong>${escapeHtml(activeVariant.name)}</strong><span>${escapeHtml(activeVariant.description || 'Only its overrides will be changed below.')}</span></div>`}
+        ${!activeVariant ? `<div class="instructions"><div class="section-title"><h3>Method</h3><button class="text-button" type="button" data-action="add-step">Add step</button></div><div id="instruction-lines">${(recipe.instructions || []).map((step, index) => `<div class="instruction-line"><span>${index + 1}</span><textarea data-step-index="${index}" placeholder="Step ${index + 1}">${escapeHtml(step)}</textarea><button type="button" class="text-button danger-text" data-action="delete-step" data-step-index="${index}">Remove</button></div>`).join('')}</div></div>` : ''}
+        ${!activeVariant ? `<section class="ingredients"><div class="section-title"><div><h3>Ingredients</h3><p>Change a quantity or unit—the stored amount remains canonical grams.</p></div><button class="secondary-button" type="button" data-action="add-line">Add ingredient</button></div><div id="base-lines">${recipe.ingredients.map((line) => lineEditor(line, { recipeId: recipe.id })).join('')}</div></section>` : renderVariantEditor(recipe, activeVariant)}
+        ${!activeVariant ? '<button class="primary-button" type="submit">Save recipe</button>' : ''}
+      </form>
+      <section class="variants"><div class="section-title"><div><h3>Variations</h3><p>Variations are small patches over this recipe, not duplicate copies.</p></div></div><div class="variant-tabs"><button type="button" data-action="select-variant" data-variant-id="" class="variant-tab${!activeVariant ? ' active' : ''}">Base</button>${(recipe.variants || []).map((variant) => `<button type="button" data-action="select-variant" data-variant-id="${variant.id}" class="variant-tab${activeVariant?.id === variant.id ? ' active' : ''}">${escapeHtml(variant.name)}</button>`).join('')}</div><form data-form="variant" data-recipe-id="${recipe.id}" class="add-variant"><input name="name" required placeholder="New variation, e.g. egg-free" /><input name="description" placeholder="What changes?" /><button class="secondary-button" type="submit">Add variation</button></form></section>
+    </main>
+    <aside class="preview panel"><p class="eyebrow">Live conversion</p><h2>${formatNumber(nutrition.calories, 0)} kcal</h2><p>${formatNumber(nutrition.perServing, 0)} kcal per serving · ${formatNumber(nutrition.grams, 0)} g total</p><label>Preview yield<input data-action="scale" type="number" min="0.1" step="any" value="${state.scaleTarget || recipeYield(recipe)}" /></label><div class="scaled-list">${nutrition.scaledIngredients.map((line) => { const ingredient = ingredientById(line.ingredientId) || {}; return `<div><strong>${escapeHtml(ingredient.name || 'Unlinked ingredient')}</strong><span>${formatNumber(convertGramsToUnit(line.scaledGrams, line.displayUnit || 'g', ingredient, state.customUnits))} ${escapeHtml(line.displayUnit || 'g')} <small>(${formatNumber(line.scaledGrams, 0)} g)</small></span></div>`; }).join('')}</div><p class="hint">This changes only the preview. Planned servings can later be saved separately.</p></aside>
+  </section>`;
+}
+
+function renderVariantEditor(recipe, variant) {
+  const overridden = new Set((variant.changes || []).filter((change) => change.type !== 'add').map((change) => change.baseLineId));
+  const changes = variant.changes || [];
+  return `<section class="ingredients"><div class="section-title"><div><h3>${escapeHtml(variant.name)} overrides</h3><p>Replace or remove a base line, or add a new ingredient just for this variation.</p></div><button class="secondary-button" type="button" data-action="add-variant-line" data-variant-id="${variant.id}">Add ingredient</button></div><div class="base-reference">${recipe.ingredients.map((line) => { const ing = ingredientById(line.ingredientId) || {}; return `<div><span>${escapeHtml(ing.name)}</span>${overridden.has(line.id) ? '<small>Overridden</small>' : `<button class="text-button" type="button" data-action="override-line" data-line-id="${line.id}" data-variant-id="${variant.id}">Override</button>`}</div>`; }).join('')}</div><div class="variant-change-lines">${changes.map((change) => change.type === 'remove' ? `<div class="removed-line">Removed base ingredient <button class="text-button danger-text" type="button" data-action="delete-variant-change" data-variant-id="${variant.id}" data-line-id="${change.baseLineId}">Undo</button></div>` : lineEditor(change.line, { recipeId: recipe.id, variantId: variant.id, baseLineId: change.baseLineId || change.line.id, isVariant: true })).join('')}</div><button class="danger-outline" type="button" data-action="delete-variant" data-variant-id="${variant.id}">Delete variation</button></section>`;
+}
+
+function renderIngredients() {
+  return `<section class="library-page"><div class="page-heading"><div><p class="eyebrow">Canonical library</p><h1>Ingredients</h1><p>Recipes point here for names, aliases, density, and nutrition.</p></div></div><div class="library-layout"><form class="panel create-panel" data-form="ingredient"><h2>New ingredient</h2><label>Name<input name="name" required placeholder="e.g. Tahini" /></label><label>Aliases <span>comma separated</span><input name="aliases" placeholder="sesame paste" /></label><div class="two-up"><label>kcal / g<input name="caloriesPerGram" type="number" min="0" step="any" value="0" /></label><label>density g / mL<input name="densityGPerMl" type="number" min="0" step="any" value="1" /></label></div><button class="primary-button" type="submit">Create ingredient</button></form><div class="panel library-list"><h2>${state.ingredients.length} ingredients</h2>${state.ingredients.map((ingredient) => `<form class="library-row" data-form="ingredient-update" data-ingredient-id="${ingredient.id}"><div><input name="name" value="${escapeHtml(ingredient.name)}" /><input name="aliases" value="${escapeHtml((ingredient.aliases || []).join(', '))}" placeholder="aliases" /></div><div class="mini-field"><label>kcal/g<input name="caloriesPerGram" type="number" min="0" step="any" value="${ingredient.caloriesPerGram || 0}" /></label><label>g/mL<input name="densityGPerMl" type="number" min="0" step="any" value="${ingredient.densityGPerMl || 0}" /></label></div><button class="text-button" type="submit">Save</button><button class="text-button danger-text" type="button" data-action="delete-ingredient" data-ingredient-id="${ingredient.id}">Delete</button></form>`).join('')}</div></div></section>`;
+}
+
+function renderUnits() {
+  return `<section class="library-page"><div class="page-heading"><p class="eyebrow">Conversion library</p><h1>Measurements</h1><p>Built-in units are fixed. Add product or household units once and reuse them everywhere.</p></div><div class="library-layout"><form class="panel create-panel" data-form="unit"><h2>New custom unit</h2><label>Name<input name="name" required placeholder="large can" /></label><label>Type<select name="kind"><option value="mass">Mass (equivalent to grams)</option><option value="volume">Volume (equivalent to mL)</option></select></label><label>Equivalent amount<input name="amount" required type="number" min="0.001" step="any" placeholder="439" /></label><label>Description<input name="description" placeholder="optional reminder" /></label><button class="primary-button" type="submit">Add unit</button></form><div class="panel library-list"><h2>Built in</h2><div class="unit-pills">${BUILTIN_UNITS.map((unit) => `<span>${unit.name} <small>${unit.kind === 'mass' ? `${unit.grams} g` : `${unit.ml} mL`}</small></span>`).join('')}</div><h2>Custom units</h2>${state.customUnits.length ? state.customUnits.map((unit) => `<form class="library-row unit-row" data-form="unit-update" data-unit-id="${unit.id}"><input name="name" value="${escapeHtml(unit.name)}" /><select name="kind"><option value="mass"${unit.kind === 'mass' ? ' selected' : ''}>mass</option><option value="volume"${unit.kind === 'volume' ? ' selected' : ''}>volume</option></select><input name="amount" type="number" min="0.001" step="any" value="${unit.kind === 'mass' ? unit.grams : unit.ml}" /><input name="description" value="${escapeHtml(unit.description || '')}" placeholder="description" /><button class="text-button" type="submit">Save</button><button class="text-button danger-text" type="button" data-action="delete-unit" data-unit-id="${unit.id}">Delete</button></form>`).join('') : '<p class="hint">No custom units yet.</p>'}</div></div></section>`;
+}
+
+function renderTransfer() {
+  const recipe = selectedRecipe();
+  return `<section class="transfer-page"><div class="page-heading"><p class="eyebrow">Portable data</p><h1>Import & export</h1><p>Use schema.org Recipe JSON to move recipes through compatible scrapers and tools.</p></div><div class="transfer-grid"><section class="panel"><h2>Export selected recipe</h2><p>${recipe ? `Export <strong>${escapeHtml(recipe.title)}</strong> as a standard schema.org Recipe. YARA’s extra structured fields are preserved in an extension property.` : 'Select a recipe first.'}</p><button class="primary-button" type="button" data-action="export-schema" ${recipe ? '' : 'disabled'}>Download schema.org JSON</button></section><form class="panel" data-form="schema-import"><h2>Import schema.org Recipe</h2><p>Paste JSON-LD from a scraper. Unknown ingredients are added as review-needed library entries so you can set density and calories.</p><textarea name="json" required placeholder='{"@context":"https://schema.org", "@type":"Recipe", ...}'></textarea><button class="secondary-button" type="submit">Import recipe</button></form><section class="panel"><h2>Local-first storage</h2><p>Your library is stored in this browser’s IndexedDB. This makes editing instant and keeps it usable offline; Drive sync can be added as a separate synchronization adapter without changing recipes themselves.</p></section></div></section>`;
+}
+
+function render() {
+  const content = state.view === 'ingredients' ? renderIngredients() : state.view === 'units' ? renderUnits() : state.view === 'transfer' ? renderTransfer() : renderRecipeEditor();
+  app.innerHTML = `<div class="app-shell"><header class="topbar"><a class="brand" href="#" data-action="view" data-view="recipes"><span>Y</span><div><strong>YARA</strong><small>Your adaptable recipe archive</small></div></a><nav>${[['recipes', 'Recipes'], ['ingredients', 'Ingredients'], ['units', 'Measurements'], ['transfer', 'Import / Export']].map(([view, label]) => `<button class="nav-link${state.view === view ? ' active' : ''}" data-action="view" data-view="${view}">${label}</button>`).join('')}</nav><div class="storage-state">Saved locally</div></header>${content}</div>`;
+}
+
+function getRecipeLine(recipe, lineId) { return recipe.ingredients.find((line) => line.id === lineId); }
+function getVariantChange(recipe, variantId, baseLineId) { return recipe.variants.find((variant) => variant.id === variantId)?.changes.find((change) => (change.baseLineId || change.line?.id) === baseLineId); }
+
+function updateLineFromElement(element) {
+  const holder = element.closest('.ingredient-line');
+  const recipe = selectedRecipe();
+  if (!holder || !recipe) return;
+  const field = element.dataset.field;
+  const variantId = holder.dataset.variantId;
+  const baseLineId = holder.dataset.baseLineId || holder.dataset.lineId;
+  const update = (line) => {
+    const next = { ...line, [field]: element.value };
+    if (field === 'ingredientId') { const ingredient = ingredientById(element.value); if (ingredient) next.ingredientId = ingredient.id; }
+    const ingredient = ingredientById(next.ingredientId) || {};
+    const unit = holder.querySelector('[data-field="displayUnit"]')?.value || next.displayUnit || 'g';
+    const quantity = holder.querySelector('[data-field="quantity"]')?.value ?? convertGramsToUnit(next.grams, unit, ingredient, state.customUnits);
+    if (field === 'quantity' || field === 'displayUnit' || field === 'ingredientId') next.grams = convertToGrams(quantity, unit, ingredient, state.customUnits);
+    next.displayUnit = unit;
+    return next;
   };
+  if (!variantId) updateRecipe(recipe.id, (current) => ({ ...current, ingredients: current.ingredients.map((line) => line.id === baseLineId ? update(line) : line) }));
+  else updateRecipe(recipe.id, (current) => ({ ...current, variants: current.variants.map((variant) => variant.id !== variantId ? variant : { ...variant, changes: variant.changes.map((change) => (change.baseLineId || change.line?.id) === baseLineId && change.line ? { ...change, line: update(change.line) } : change) }) }));
 }
 
-function normalizeState(saved) {
-  const normalized = {
-    ...initialState,
-    ...saved,
-    recipes: saved.recipes ?? initialState.recipes,
-    plan: saved.plan ?? initialState.plan,
-    folders: saved.folders ?? initialState.folders,
-    ingredients: saved.ingredients ?? initialState.ingredients,
-    measurements: saved.measurements ?? initialState.measurements,
-    driveFolders: saved.driveFolders ?? initialState.driveFolders,
-    driveStatus: saved.driveStatus ?? initialState.driveStatus,
-    selectedTab: saved.selectedTab ?? initialState.selectedTab,
-    selectedFolderId: saved.selectedFolderId ?? initialState.selectedFolderId,
-    selectedRecipeId: saved.selectedRecipeId ?? initialState.selectedRecipeId,
-    selectedRecipeScale: saved.selectedRecipeScale ?? initialState.selectedRecipeScale,
-    calendarEvents: saved.calendarEvents ?? initialState.calendarEvents
-  };
+app.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const action = button.dataset.action;
+  if (['scale'].includes(action)) return;
+  if (action === 'view') return setView(button.dataset.view);
+  if (action === 'select-recipe') return commit({ ...state, selectedRecipeId: button.dataset.recipeId, selectedVariantId: '', scaleTarget: recipeYield(recipeById(button.dataset.recipeId)) });
+  if (action === 'new-recipe') { const recipe = { id: id(), title: 'Untitled recipe', category: '', tags: [], description: '', yield: { amount: 2, unit: 'servings' }, instructions: [], ingredients: [], variants: [], createdAt: now(), updatedAt: now() }; return commit({ ...state, recipes: [recipe, ...state.recipes], selectedRecipeId: recipe.id, selectedVariantId: '', scaleTarget: 2 }); }
+  if (action === 'delete-recipe') { if (confirm('Delete this recipe?')) { const recipes = state.recipes.filter((recipe) => recipe.id !== button.dataset.recipeId); return commit({ ...state, recipes, selectedRecipeId: recipes[0]?.id || '', selectedVariantId: '' }); } return; }
+  if (action === 'add-line') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, ingredients: [...recipe.ingredients, { id: id(), ingredientId: state.ingredients[0]?.id || '', grams: 0, displayUnit: 'g', note: '' }] }));
+  if (action === 'delete-line') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, ingredients: recipe.ingredients.filter((line) => line.id !== button.dataset.lineId) }));
+  if (action === 'add-step') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, instructions: [...recipe.instructions, ''] }));
+  if (action === 'delete-step') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, instructions: recipe.instructions.filter((_, index) => index !== Number(button.dataset.stepIndex)) }));
+  if (action === 'select-variant') return commit({ ...state, selectedVariantId: button.dataset.variantId });
+  if (action === 'delete-variant') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, variants: recipe.variants.filter((variant) => variant.id !== button.dataset.variantId) })).then(() => commit({ ...state, selectedVariantId: '' }));
+  if (action === 'override-line') return updateRecipe(selectedRecipe().id, (recipe) => { const base = getRecipeLine(recipe, button.dataset.lineId); return { ...recipe, variants: recipe.variants.map((variant) => variant.id !== button.dataset.variantId ? variant : { ...variant, changes: [...variant.changes, { type: 'replace', baseLineId: base.id, line: { ...base } }] }) }; });
+  if (action === 'add-variant-line') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, variants: recipe.variants.map((variant) => variant.id !== button.dataset.variantId ? variant : { ...variant, changes: [...variant.changes, { type: 'add', line: { id: id(), ingredientId: state.ingredients[0]?.id || '', grams: 0, displayUnit: 'g', note: '' } }] }) }));
+  if (action === 'delete-variant-change') return updateRecipe(selectedRecipe().id, (recipe) => ({ ...recipe, variants: recipe.variants.map((variant) => variant.id !== button.dataset.variantId ? variant : { ...variant, changes: variant.changes.filter((change) => (change.baseLineId || change.line?.id) !== button.dataset.lineId) }) }));
+  if (['quick-ingredient', 'quick-alias', 'quick-unit'].includes(action)) { const property = action === 'quick-ingredient' ? 'quickIngredientFor' : action === 'quick-alias' ? 'quickAliasFor' : 'quickUnitFor'; ui[property] = `${button.dataset.variantId || ''}:${button.dataset.lineId}`; return render(); }
+  if (action === 'delete-ingredient') { const isUsed = state.recipes.some((recipe) => recipe.ingredients.some((line) => line.ingredientId === button.dataset.ingredientId)); if (isUsed) return alert('This ingredient is used by a recipe. Re-link its recipe lines before deleting it.'); return commit({ ...state, ingredients: state.ingredients.filter((item) => item.id !== button.dataset.ingredientId) }); }
+  if (action === 'delete-unit') return commit({ ...state, customUnits: state.customUnits.filter((unit) => unit.id !== button.dataset.unitId) });
+  if (action === 'export-schema') { const recipe = selectedRecipe(); const nutrition = calculateRecipeNutrition(recipe, recipeYield(recipe), state.customUnits, ingredientMap()); const schema = recipeToSchema({ ...recipe, calories: nutrition.calories }, state.ingredients, state.customUnits); const blob = new Blob([JSON.stringify(schema, null, 2)], { type: 'application/ld+json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${recipe.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'recipe'}.json`; link.click(); URL.revokeObjectURL(link.href); }
+});
 
-  normalized.recipes = normalized.recipes.map((recipe) => ({
-    ...recipe,
-    ingredients: (recipe.ingredients || []).map(prepareIngredientLine)
-  }));
+app.addEventListener('change', (event) => {
+  const target = event.target;
+  if (target.matches('.ingredient-line [data-field]')) return updateLineFromElement(target);
+  if (target.dataset.action === 'scale') return commit({ ...state, scaleTarget: Number(target.value) || recipeYield(selectedRecipe()) });
+});
 
-  return normalized;
+app.addEventListener('submit', async (event) => {
+  const form = event.target.closest('form[data-form]');
+  if (!form) return;
+  event.preventDefault();
+  const data = new FormData(form);
+  const type = form.dataset.form;
+  if (type === 'recipe') { const recipeId = form.dataset.recipeId; const steps = [...form.querySelectorAll('[data-step-index]')].map((item) => item.value.trim()).filter(Boolean); return updateRecipe(recipeId, (recipe) => ({ ...recipe, title: data.get('title').trim() || 'Untitled recipe', category: data.get('category').trim(), tags: data.get('tags').split(',').map((tag) => tag.trim()).filter(Boolean), description: data.get('description').trim(), yield: { amount: Number(data.get('yield')) || 1, unit: data.get('yieldUnit').trim() || 'servings' }, instructions: steps })); }
+  if (type === 'variant') { const variant = { id: id(), name: data.get('name').trim(), description: data.get('description').trim(), changes: [] }; return updateRecipe(form.dataset.recipeId, (recipe) => ({ ...recipe, variants: [...recipe.variants, variant] })).then(() => commit({ ...state, selectedVariantId: variant.id })); }
+  if (type === 'ingredient' || type === 'quick-ingredient') { const ingredient = { id: id(), name: data.get('name').trim(), aliases: String(data.get('aliases') || '').split(',').map((item) => item.trim()).filter(Boolean), caloriesPerGram: Number(data.get('caloriesPerGram')) || 0, densityGPerMl: Number(data.get('densityGPerMl')) || 0 }; const next = { ...state, ingredients: [...state.ingredients, ingredient] }; if (type === 'quick-ingredient') { const lineId = form.dataset.lineId; const variantId = form.dataset.variantId; const recipe = selectedRecipe(); if (!variantId) next.recipes = state.recipes.map((current) => current.id !== recipe.id ? current : { ...current, ingredients: current.ingredients.map((line) => line.id === lineId ? { ...line, ingredientId: ingredient.id } : line) }); else next.recipes = state.recipes.map((current) => current.id !== recipe.id ? current : { ...current, variants: current.variants.map((variant) => variant.id !== variantId ? variant : { ...variant, changes: variant.changes.map((change) => (change.baseLineId || change.line?.id) === lineId && change.line ? { ...change, line: { ...change.line, ingredientId: ingredient.id } } : change) }) }); ui.quickIngredientFor = null; } return commit(next); }
+  if (type === 'quick-alias') { const line = form.closest('.ingredient-line'); const variantId = form.dataset.variantId; let source = !variantId ? getRecipeLine(selectedRecipe(), form.dataset.lineId) : getVariantChange(selectedRecipe(), variantId, form.dataset.lineId)?.line; const ingredient = ingredientById(source?.ingredientId); if (!ingredient) return; ui.quickAliasFor = null; return commit({ ...state, ingredients: state.ingredients.map((item) => item.id === ingredient.id ? { ...item, aliases: [...new Set([...item.aliases, data.get('alias').trim()])].filter(Boolean) } : item) }); }
+  if (type === 'quick-unit' || type === 'unit') { const kind = data.get('kind'); const unit = { id: id(), name: data.get('name').trim(), kind, [kind === 'mass' ? 'grams' : 'ml']: Number(data.get('amount')) || 1, description: data.get('description')?.trim() || '' }; const next = { ...state, customUnits: [...state.customUnits, unit] }; if (type === 'quick-unit') { const lineId = form.dataset.lineId; const variantId = form.dataset.variantId; const recipe = selectedRecipe(); if (!variantId) next.recipes = state.recipes.map((current) => current.id !== recipe.id ? current : { ...current, ingredients: current.ingredients.map((line) => line.id === lineId ? { ...line, displayUnit: unit.id } : line) }); else next.recipes = state.recipes.map((current) => current.id !== recipe.id ? current : { ...current, variants: current.variants.map((variant) => variant.id !== variantId ? variant : { ...variant, changes: variant.changes.map((change) => (change.baseLineId || change.line?.id) === lineId && change.line ? { ...change, line: { ...change.line, displayUnit: unit.id } } : change) }) }); ui.quickUnitFor = null; } return commit(next); }
+  if (type === 'ingredient-update') return commit({ ...state, ingredients: state.ingredients.map((ingredient) => ingredient.id !== form.dataset.ingredientId ? ingredient : { ...ingredient, name: data.get('name').trim(), aliases: data.get('aliases').split(',').map((item) => item.trim()).filter(Boolean), caloriesPerGram: Number(data.get('caloriesPerGram')) || 0, densityGPerMl: Number(data.get('densityGPerMl')) || 0 }) });
+  if (type === 'unit-update') { const kind = data.get('kind'); return commit({ ...state, customUnits: state.customUnits.map((unit) => unit.id !== form.dataset.unitId ? unit : { ...unit, name: data.get('name').trim(), kind, grams: kind === 'mass' ? Number(data.get('amount')) || 1 : undefined, ml: kind === 'volume' ? Number(data.get('amount')) || 1 : undefined, description: data.get('description').trim() }) }); }
+  if (type === 'schema-import') { try { const result = recipeFromSchema(JSON.parse(data.get('json')), state.ingredients, state.customUnits); return commit({ ...state, ingredients: [...state.ingredients, ...result.addedIngredients], recipes: [result.recipe, ...state.recipes], selectedRecipeId: result.recipe.id, selectedVariantId: '', scaleTarget: recipeYield(result.recipe), view: 'recipes' }); } catch (error) { alert(error.message); } }
+});
+
+async function start() {
+  try { const saved = await loadDatabaseState(); if (saved?.version) state = { ...structuredClone(seed), ...saved, view: 'recipes', selectedRecipeId: saved.selectedRecipeId || saved.recipes?.[0]?.id || '' }; } catch (error) { console.warn('IndexedDB is unavailable; using this-tab state.', error); }
+  render();
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch((error) => console.warn('Service worker registration failed.', error));
 }
 
-function loadState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return normalizeState({});
-    }
-    const parsed = JSON.parse(raw);
-    return normalizeState(parsed);
-  } catch (error) {
-    console.warn('Unable to load state', error);
-    return normalizeState({});
-  }
-}
-
-function saveState(state) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-}
-
-function getFolderName(state, folderId) {
-  return state.folders.find((folder) => folder.id === folderId)?.name || 'Unsorted';
-}
-
-function filterRecipesByFolder(state) {
-  if (state.selectedFolderId === 'all') {
-    return state.recipes;
-  }
-  return state.recipes.filter((recipe) => recipe.folderId === state.selectedFolderId);
-}
-
-function selectedRecipe(state) {
-  return state.recipes.find((recipe) => recipe.id === state.selectedRecipeId) || null;
-}
-
-function getRecipeCountForFolder(state, folderId) {
-  return state.recipes.filter((recipe) => recipe.folderId === folderId).length;
-}
-
-function createIngredientLinesHtml(recipe, state, previewScale) {
-  return (recipe.ingredients || []).map((item) => {
-    const scale = previewScale || recipe.baseYield || 1;
-    const scaledGrams = (item.grams || 0) * (scale / (recipe.baseYield || 1));
-    const displayCount = convertGramsToUnit(scaledGrams, item.displayUnit, item.ingredient);
-    return `
-      <div class="ingredient-row" data-id="${item.id}" data-ingredient-id="${item.ingredientId || ''}">
-        <div class="ingredient-main">
-          <input name="ingredientName" value="${escapeHtml(item.name)}" placeholder="Ingredient" />
-          <div class="row ingredient-meta-row">
-            <label>
-              <span class="label-text">Grams</span>
-              <input name="grams" type="number" min="0" step="1" value="${item.grams}" />
-            </label>
-            <label>
-              <span class="label-text">Display</span>
-              <select name="displayUnit">
-                ${state.measurements.map((measure) => `<option value="${measure.name}"${measure.name === item.displayUnit ? ' selected' : ''}>${escapeHtml(measure.name)}</option>`).join('')}
-              </select>
-            </label>
-            <label>
-              <span class="label-text">kcal/g</span>
-              <input name="ingredientCalories" type="number" min="0" step="0.01" value="${Number(item.ingredient?.caloriesPerGram || 0)}" />
-            </label>
-          </div>
-        </div>
-        <div class="ingredient-row-foot">
-          <span class="small">Preview: ${Number(displayCount.toFixed(2))} ${escapeHtml(item.displayUnit)}</span>
-          <button type="button" class="danger remove-ingredient">Remove</button>
-        </div>
-      </div>
-    `;
-  }).join('');
-}
-
-function render(state) {
-  const app = document.getElementById('app');
-  const user = getIdTokenClaims();
-
-  app.innerHTML = `
-    <div class="app-shell">
-      <nav class="app-nav">
-        <div class="brand">
-          <h1>Recipe Planner</h1>
-        </div>
-        <div class="nav-links">
-          <button class="nav-button${state.selectedTab === 'recipes' ? ' active' : ''}" data-tab="recipes">Recipes</button>
-          <button class="nav-button${state.selectedTab === 'calendar' ? ' active' : ''}" data-tab="calendar">Calendar</button>
-          <button class="nav-button${state.selectedTab === 'settings' ? ' active' : ''}" data-tab="settings">Settings</button>
-        </div>
-        <div class="nav-footer">
-          ${user ? `<div class="user-badge">${escapeHtml(user.email || user.name || 'Signed in')}</div><button id="sign-out" class="secondary">Sign out</button>` : '<button id="sign-in" class="primary">Sign in with Google</button>'}
-        </div>
-      </nav>
-      <main class="app-main">
-        <header class="app-header">
-          <div>
-            <h2>${state.selectedTab === 'recipes' ? 'Recipes' : state.selectedTab === 'calendar' ? 'Calendar' : 'Settings'}</h2>
-            <p class="small">${state.selectedTab === 'recipes' ? 'Organize, edit, and preview recipes with grams-first storage.' : state.selectedTab === 'calendar' ? 'Plan meals and sync events to Google Calendar.' : 'Manage ingredients, folders, and sync settings.'}</p>
-          </div>
-          <div>${user ? '<span class="pill">Google connected</span>' : '<span class="pill muted">Offline mode</span>'}</div>
-        </header>
-        <section id="tab-content" class="content-panel"></section>
-      </main>
-    </div>
-  `;
-
-  const signInButton = document.getElementById('sign-in');
-  if (signInButton) {
-    signInButton.addEventListener('click', () => signIn(GOOGLE_CLIENT_ID, REDIRECT_URI, GOOGLE_SCOPES));
-  }
-
-  const signOutButton = document.getElementById('sign-out');
-  if (signOutButton) {
-    signOutButton.addEventListener('click', () => {
-      signOut();
-      render(loadState());
-    });
-  }
-
-  document.querySelectorAll('.nav-button').forEach((button) => {
-    button.addEventListener('click', () => {
-      render({ ...state, selectedTab: button.dataset.tab, selectedRecipeId: null });
-    });
-  });
-
-  renderTabContent(state);
-}
-
-function renderTabContent(state) {
-  const tabContent = document.getElementById('tab-content');
-
-  if (state.selectedTab === 'recipes') {
-    tabContent.innerHTML = renderRecipesPage(state);
-    attachRecipeEvents(state);
-    attachRecipeFormEvents(state);
-  } else if (state.selectedTab === 'calendar') {
-    tabContent.innerHTML = renderCalendarPage(state);
-    attachCalendarEvents(state);
-  } else if (state.selectedTab === 'settings') {
-    tabContent.innerHTML = renderSettingsPage(state);
-    attachSettingsEvents(state);
-  }
-}
-
-function renderRecipesPage(state) {
-  const activeFolder = state.selectedFolderId === 'all' ? 'All recipes' : getFolderName(state, state.selectedFolderId);
-  const filteredRecipes = filterRecipesByFolder(state);
-  const recipeCount = filteredRecipes.length;
-
-  return `
-    <div class="recipes-page">
-      <aside class="recipe-sidebar card">
-        <div class="panel-title">Folders</div>
-        <div class="folder-list">
-          <button class="folder-button${state.selectedFolderId === 'all' ? ' active' : ''}" data-folder-id="all">All recipes (${state.recipes.length})</button>
-          ${state.folders.map((folder) => `
-            <button class="folder-button${state.selectedFolderId === folder.id ? ' active' : ''}" data-folder-id="${folder.id}">
-              ${escapeHtml(folder.name)} (${getRecipeCountForFolder(state, folder.id)})
-            </button>
-          `).join('')}
-        </div>
-        <form id="folder-form" class="compact-form folder-form">
-          <label>
-            <span class="label-text">New folder</span>
-            <input name="folderName" placeholder="Folder name" />
-          </label>
-          <button type="submit" class="secondary">Add folder</button>
-        </form>
-      </aside>
-
-      <section class="recipe-list-panel">
-        <div class="panel-row">
-          <div>
-            <div class="panel-title">${escapeHtml(activeFolder)}</div>
-            <p class="small">${recipeCount} recipe${recipeCount === 1 ? '' : 's'} in this view.</p>
-          </div>
-          <button id="reset-state" class="secondary">Reset demo</button>
-        </div>
-
-        <div class="cards-grid">
-          ${filteredRecipes.length ? filteredRecipes.map((recipe) => renderRecipeCard(recipe, state)).join('') : '<div class="empty-state card"><p>No recipes in this folder yet. Add one from the form below.</p></div>'}
-        </div>
-
-        <div class="card add-card">
-          <div class="panel-title">New recipe</div>
-          <form id="recipe-form" class="compact-form">
-            <label>
-              <span class="label-text">Recipe title</span>
-              <input name="title" placeholder="Recipe title" required />
-            </label>
-            <div class="row wrap-gap">
-              <label>
-                <span class="label-text">Category</span>
-                <input name="category" placeholder="Category" />
-              </label>
-              <label>
-                <span class="label-text">Base servings</span>
-                <input name="baseYield" type="number" min="1" value="2" placeholder="Servings" />
-              </label>
-            </div>
-            <label>
-              <span class="label-text">Instructions</span>
-              <textarea name="instructions" placeholder="Write the recipe instructions here..."></textarea>
-            </label>
-            <div class="panel-title small">Primary ingredient</div>
-            <div class="row wrap-gap">
-              <label>
-                <span class="label-text">Ingredient</span>
-                <input name="ingredientName" placeholder="Ingredient name" />
-              </label>
-              <label>
-                <span class="label-text">Grams</span>
-                <input name="ingredientGrams" type="number" min="0" step="1" value="100" placeholder="Grams" />
-              </label>
-              <label>
-                <span class="label-text">Display unit</span>
-                <select name="ingredientUnit">${state.measurements.map((measure) => `<option value="${measure.name}">${escapeHtml(measure.name)}</option>`).join('')}</select>
-              </label>
-              <label>
-                <span class="label-text">kcal/g</span>
-                <input name="ingredientCalories" type="number" min="0" step="0.01" value="0.34" placeholder="0.34" />
-              </label>
-              <label>
-                <span class="label-text">Density</span>
-                <input name="ingredientDensity" type="number" min="0.01" step="0.01" value="1" placeholder="g/ml" />
-              </label>
-            </div>
-            <button type="submit" class="primary">Create recipe</button>
-          </form>
-        </div>
-      </section>
-
-      <aside class="recipe-detail-aside card">
-        ${state.selectedRecipeId ? renderRecipeDetail(state) : '<div class="empty-state"><h3>Recipe preview</h3><p>Select a recipe card to edit it quickly, then scale without changing the base recipe.</p></div>'}
-      </aside>
-    </div>
-  `;
-}
-
-function renderRecipeCard(recipe, state) {
-  const nutrition = calculateRecipeNutrition(recipe, recipe.baseYield || 1);
-  const ingredientPreview = recipe.ingredients.slice(0, 3).map((item) => `${Math.round(convertGramsToUnit(item.grams || 0, item.displayUnit || 'g', item.ingredient))} ${escapeHtml(item.displayUnit || 'g')} ${escapeHtml(item.name)}`).join(' • ');
-
-  return `
-    <article class="recipe-card" draggable="true" data-id="${recipe.id}">
-      <div class="card-top">
-        <strong>${escapeHtml(recipe.title)}</strong>
-        <span class="badge">${Math.round(nutrition.perServing)} kcal</span>
-      </div>
-      <div class="card-meta">
-        <span>${escapeHtml(recipe.category || 'Uncategorized')}</span>
-        <span>${escapeHtml(getFolderName(state, recipe.folderId))}</span>
-      </div>
-      <p class="tiny">${escapeHtml(recipe.instructions || 'No instructions yet.')}</p>
-      <div class="ingredient-teaser">${ingredientPreview}</div>
-    </article>
-  `;
-}
-
-function renderRecipeDetail(state) {
-  const recipe = selectedRecipe(state);
-  if (!recipe) {
-    return '<div class="empty-state"><p>Recipe not found.</p></div>';
-  }
-
-  const previewScale = state.selectedRecipeScale || recipe.baseYield || 1;
-  const previewIngredients = calculateScaledIngredients(recipe, previewScale);
-  const nutrition = calculateRecipeNutrition(recipe, previewScale);
-
-  return `
-    <div class="detail-top">
-      <div>
-        <div class="panel-title">${escapeHtml(recipe.title)}</div>
-        <p class="small">Folder: ${escapeHtml(getFolderName(state, recipe.folderId))}</p>
-      </div>
-      <span class="badge">${Math.round(nutrition.perServing)} kcal/s</span>
-    </div>
-    <form id="recipe-edit-form" class="recipe-detail-form">
-      <label class="hero-input-label">
-        <input class="hero-input" name="title" value="${escapeHtml(recipe.title)}" placeholder="Recipe title" />
-      </label>
-      <div class="row wrap-gap detail-meta-row">
-        <label>
-          <span class="label-text">Category</span>
-          <input name="category" value="${escapeHtml(recipe.category)}" placeholder="Category" />
-        </label>
-        <label>
-          <span class="label-text">Base servings</span>
-          <input name="baseYield" type="number" min="1" value="${recipe.baseYield}" />
-        </label>
-        <label>
-          <span class="label-text">Folder</span>
-          <select name="folderId">${state.folders.map((folder) => `<option value="${folder.id}"${folder.id === recipe.folderId ? ' selected' : ''}>${escapeHtml(folder.name)}</option>`).join('')}</select>
-        </label>
-      </div>
-      <label>
-        <span class="label-text">Instructions</span>
-        <textarea name="instructions" placeholder="Write steps, notes, and serving ideas...">${escapeHtml(recipe.instructions)}</textarea>
-      </label>
-
-      <div class="panel-title">Ingredients</div>
-      <div id="ingredient-rows">${createIngredientLinesHtml(recipe, state, previewScale)}</div>
-      <button type="button" id="add-ingredient" class="secondary">+ Add ingredient</button>
-
-      <div class="panel-title">Preview ingredients</div>
-      <div class="preview-list">
-        ${previewIngredients.map((item) => `
-          <div class="preview-item">
-            <strong>${escapeHtml(item.name)}</strong>
-            <span>${Math.round(convertGramsToUnit(item.scaledGrams, item.displayUnit || 'g', item.ingredient))} ${escapeHtml(item.displayUnit || 'g')}</span>
-          </div>
-        `).join('')}
-      </div>
-
-      <div class="panel-title">Scale preview</div>
-      <div class="field-row">
-        <label>
-          <span class="label-text">Preview servings</span>
-          <input id="detail-scale" type="number" min="1" value="${previewScale}" />
-        </label>
-        <div class="preview-summary">${Math.round(nutrition.calories)} kcal total · ${Math.round(nutrition.perServing)} kcal / serving</div>
-      </div>
-
-      <div class="detail-actions">
-        <button type="submit" class="primary">Save changes</button>
-        <button type="button" id="delete-recipe" class="danger">Delete</button>
-      </div>
-    </form>
-  `;
-}
-
-function renderCalendarPage(state) {
-  return `
-    <div class="calendar-page">
-      <div class="card compact-card">
-        <div class="panel-title">Plan a meal</div>
-        <form id="plan-form" class="compact-form">
-          <input name="date" type="date" required />
-          <select name="recipeId">${state.recipes.map((recipe) => `<option value="${recipe.id}">${escapeHtml(recipe.title)}</option>`).join('')}</select>
-          <input name="servings" type="number" min="1" value="2" />
-          <button type="submit" class="primary">Add meal plan</button>
-        </form>
-      </div>
-      <div class="card compact-card">
-        <div class="panel-title">Google Calendar</div>
-        <button id="load-google-events" class="secondary">Load Calendar events</button>
-        <div class="event-list">${renderGoogleEvents(state)}</div>
-      </div>
-      <div class="card">
-        <div class="panel-title">Planned meals</div>
-        <ul>${state.plan.length ? state.plan.map((entry) => {
-          const recipe = state.recipes.find((item) => item.id === entry.recipeId);
-          return `<li>${formatDate(entry.date)} � ${escapeHtml(recipe?.title || 'Recipe')} (${entry.servings} servings) ${entry.calendarEventId ? '<span class="badge">Synced</span>' : ''}</li>`;
-        }).join('') : '<li class="small muted">No planned meals yet.</li>'}</ul>
-      </div>
-    </div>
-  `;
-}
-
-function renderSettingsPage(state) {
-  return `
-    <div class="settings-page">
-      <div class="card compact-card">
-        <div class="panel-title">Ingredients</div>
-        <ul>${state.ingredients.length ? state.ingredients.map((ingredient) => `<li>${escapeHtml(ingredient.name)} (${escapeHtml((ingredient.aliases || []).join(', '))}) � ${ingredient.caloriesPerGram} kcal/g</li>`).join('') : '<li class="small muted">No ingredients defined.</li>'}</ul>
-      </div>
-      <div class="card compact-card">
-        <div class="panel-title">Measurements</div>
-        <ul>${state.measurements.length ? state.measurements.map((measure) => `<li>${escapeHtml(measure.name)} � ${measure.ml !== null ? `${measure.ml} ml` : 'gram-based'}</li>`).join('') : '<li class="small muted">No measurements defined.</li>'}</ul>
-      </div>
-      <div class="card compact-card">
-        <div class="panel-title">Drive sync</div>
-        <button id="google-sync" class="primary">Sync recipes to Drive</button>
-        <p class="small">${state.driveStatus === 'synced' ? 'Drive sync complete' : 'Not synced yet'}</p>
-      </div>
-    </div>
-  `;
-}
-
-function renderGoogleEvents(state) {
-  if (!state.calendarEvents || state.calendarEvents.length === 0) {
-    return '<p class="small muted">No Google Calendar events loaded.</p>';
-  }
-  return state.calendarEvents.map((event) => {
-    const date = event.start?.date || event.start?.dateTime || 'Unknown date';
-    return `<div class="event-card"><strong>${escapeHtml(event.summary || 'Untitled event')}</strong><div class="small">${escapeHtml(date)}</div></div>`;
-  }).join('');
-}
-
-function attachRecipeEvents(state) {
-  document.querySelectorAll('.recipe-card').forEach((card) => {
-    card.addEventListener('click', () => {
-      render({ ...state, selectedRecipeId: card.dataset.id, selectedRecipeScale: selectedRecipe(state)?.baseYield || 1 });
-    });
-    card.addEventListener('dragstart', (event) => {
-      event.dataTransfer.setData('text/plain', card.dataset.id);
-      card.classList.add('dragging');
-    });
-    card.addEventListener('dragend', () => {
-      card.classList.remove('dragging');
-    });
-  });
-
-  document.querySelectorAll('.folder-button').forEach((button) => {
-    button.addEventListener('click', () => {
-      render({ ...state, selectedFolderId: button.dataset.folderId, selectedRecipeId: null });
-    });
-  });
-
-  document.querySelectorAll('.folder-drop-zone').forEach((zone) => {
-    zone.addEventListener('dragover', (event) => {
-      event.preventDefault();
-      zone.classList.add('drag-over');
-    });
-    zone.addEventListener('dragleave', () => {
-      zone.classList.remove('drag-over');
-    });
-    zone.addEventListener('drop', (event) => {
-      event.preventDefault();
-      zone.classList.remove('drag-over');
-      const recipeId = event.dataTransfer.getData('text/plain');
-      const folderId = zone.dataset.folderId;
-      if (!recipeId || !folderId) {
-        return;
-      }
-      const nextState = {
-        ...state,
-        recipes: state.recipes.map((recipe) => (recipe.id === recipeId ? { ...recipe, folderId } : recipe))
-      };
-      saveState(nextState);
-      render(nextState);
-    });
-  });
-
-  const recipeForm = document.getElementById('recipe-form');
-  if (recipeForm) {
-    recipeForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const formData = new FormData(recipeForm);
-      const ingredientName = formData.get('ingredientName')?.toString().trim() || 'Ingredient';
-      const ingredient = {
-        name: ingredientName,
-        caloriesPerGram: Number(formData.get('ingredientCalories') || 0),
-        density: Number(formData.get('ingredientDensity') || 1)
-      };
-      const recipe = {
-        id: crypto.randomUUID(),
-        title: formData.get('title')?.toString().trim() || 'New recipe',
-        category: formData.get('category')?.toString().trim() || 'Uncategorized',
-        baseYield: Number(formData.get('baseYield') || 1),
-        instructions: formData.get('instructions')?.toString().trim(),
-        folderId: formData.get('folderId')?.toString() || state.folders[0]?.id,
-        ingredients: [
-          {
-            id: crypto.randomUUID(),
-            ingredientId: formData.get('ingredientId')?.toString() || `custom-${crypto.randomUUID()}`,
-            name: ingredientName,
-            grams: Number(formData.get('ingredientGrams') || 0),
-            displayUnit: formData.get('ingredientUnit')?.toString() || 'g',
-            ingredient
-          }
-        ]
-      };
-
-      let nextState = { ...state, recipes: [recipe, ...state.recipes] };
-      saveState(nextState);
-      if (getIdTokenClaims()) {
-        try {
-          const result = await syncRecipesToDrive(nextState);
-          nextState = {
-            ...nextState,
-            recipes: result.recipes,
-            folders: result.folders,
-            ingredients: result.ingredients,
-            measurements: result.measurements,
-            driveFolders: result.driveFolders,
-            driveStatus: 'synced'
-          };
-          saveState(nextState);
-        } catch (error) {
-          console.error('Drive sync failed:', error);
-        }
-      }
-      render(nextState);
-    });
-  }
-
-  const folderForm = document.getElementById('folder-form');
-  if (folderForm) {
-    folderForm.addEventListener('submit', (event) => {
-      event.preventDefault();
-      const formData = new FormData(folderForm);
-      const folderName = formData.get('folderName')?.toString().trim();
-      if (!folderName) return;
-      const nextState = { ...state, folders: [{ id: crypto.randomUUID(), name: folderName }, ...state.folders] };
-      saveState(nextState);
-      render(nextState);
-    });
-  }
-
-  const resetButton = document.getElementById('reset-state');
-  if (resetButton) {
-    resetButton.addEventListener('click', () => {
-      saveState(initialState);
-      render(loadState());
-    });
-  }
-}
-
-function attachRecipeFormEvents(state) {
-  const detailForm = document.getElementById('recipe-edit-form');
-  if (!detailForm) return;
-
-  detailForm.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const formData = new FormData(detailForm);
-    const recipe = selectedRecipe(state);
-    if (!recipe) return;
-
-    const updatedRecipe = {
-      ...recipe,
-      title: formData.get('title')?.toString().trim() || recipe.title,
-      category: formData.get('category')?.toString().trim() || recipe.category,
-      baseYield: Number(formData.get('baseYield') || recipe.baseYield),
-      instructions: formData.get('instructions')?.toString().trim() || recipe.instructions,
-      folderId: formData.get('folderId')?.toString() || recipe.folderId,
-      ingredients: Array.from(detailForm.querySelectorAll('.ingredient-row')).map((row) => ({
-        id: row.dataset.id || crypto.randomUUID(),
-        ingredientId: row.dataset.ingredientId || `custom-${crypto.randomUUID()}`,
-        name: row.querySelector('[name="ingredientName"]').value.trim() || 'Ingredient',
-        grams: Number(row.querySelector('[name="grams"]').value || 0),
-        displayUnit: row.querySelector('[name="displayUnit"]').value,
-        ingredient: {
-          name: row.querySelector('[name="ingredientName"]').value.trim() || 'Ingredient',
-          caloriesPerGram: Number(row.querySelector('[name="ingredientCalories"]').value || 0),
-          density: Number(row.querySelector('[name="ingredientDensity"]').value || 1)
-        }
-      }))
-    };
-
-    let nextState = {
-      ...state,
-      recipes: state.recipes.map((item) => (item.id === updatedRecipe.id ? updatedRecipe : item)),
-      selectedRecipeScale: Number(formData.get('detail-scale') || updatedRecipe.baseYield)
-    };
-
-    saveState(nextState);
-    if (getIdTokenClaims()) {
-      try {
-        const result = await syncRecipesToDrive(nextState);
-        nextState = {
-          ...nextState,
-          recipes: result.recipes,
-          folders: result.folders,
-          ingredients: result.ingredients,
-          measurements: result.measurements,
-          driveFolders: result.driveFolders,
-          driveStatus: 'synced'
-        };
-        saveState(nextState);
-      } catch (error) {
-        console.error('Drive sync failed:', error);
-      }
-    }
-    render(nextState);
-  });
-
-  detailForm.querySelectorAll('.remove-ingredient').forEach((button) => {
-    button.addEventListener('click', () => {
-      button.closest('.ingredient-row')?.remove();
-    });
-  });
-
-  const addButton = document.getElementById('add-ingredient');
-  if (addButton) {
-    addButton.addEventListener('click', () => {
-      const container = document.getElementById('ingredient-rows');
-      if (!container) return;
-      const row = document.createElement('div');
-      row.className = 'ingredient-row';
-      row.dataset.id = crypto.randomUUID();
-      row.dataset.ingredientId = `custom-${crypto.randomUUID()}`;
-      row.innerHTML = `
-        <div class="ingredient-main">
-          <input name="ingredientName" placeholder="Ingredient" />
-          <input name="grams" type="number" min="0" step="1" value="0" />
-          <select name="displayUnit">${state.measurements.map((measure) => `<option value="${measure.name}">${escapeHtml(measure.name)}</option>`).join('')}</select>
-        </div>
-        <div class="ingredient-meta">
-          <label>
-            <span class="label-text">kcal/g</span>
-            <input name="ingredientCalories" type="number" min="0" step="0.01" value="0" />
-          </label>
-          <label>
-            <span class="label-text">Density</span>
-            <input name="ingredientDensity" type="number" min="0.01" step="0.01" value="1" />
-          </label>
-          <span class="small">Preview will update after save.</span>
-          <button type="button" class="danger remove-ingredient">Remove</button>
-        </div>
-      `;
-      container.appendChild(row);
-      row.querySelector('.remove-ingredient')?.addEventListener('click', () => row.remove());
-    });
-  }
-
-  const scaleInput = document.getElementById('detail-scale');
-  if (scaleInput) {
-    scaleInput.addEventListener('input', (event) => {
-      const recipe = selectedRecipe(state);
-      if (!recipe) return;
-      const nextState = { ...state, selectedRecipeScale: Number(event.currentTarget.value) || recipe.baseYield };
-      render(nextState);
-    });
-  }
-
-  const deleteButton = document.getElementById('delete-recipe');
-  if (deleteButton) {
-    deleteButton.addEventListener('click', () => {
-      if (!confirm('Delete this recipe?')) return;
-      const nextState = {
-        ...state,
-        recipes: state.recipes.filter((recipe) => recipe.id !== state.selectedRecipeId),
-        selectedRecipeId: null
-      };
-      saveState(nextState);
-      render(nextState);
-    });
-  }
-}
-
-function attachCalendarEvents(state) {
-  const planForm = document.getElementById('plan-form');
-  if (planForm) {
-    planForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const formData = new FormData(planForm);
-      const entry = {
-        id: crypto.randomUUID(),
-        date: formData.get('date')?.toString(),
-        recipeId: formData.get('recipeId')?.toString(),
-        servings: Number(formData.get('servings') || 1)
-      };
-      let nextState = { ...state, plan: [entry, ...state.plan] };
-      saveState(nextState);
-      if (getIdTokenClaims()) {
-        try {
-          const recipe = nextState.recipes.find((item) => item.id === entry.recipeId);
-          const event = await createMealEvent(entry, recipe);
-          entry.calendarEventId = event.id;
-          nextState = { ...nextState, plan: [entry, ...state.plan] };
-          saveState(nextState);
-        } catch (error) {
-          console.error('Google Calendar sync failed:', error);
-        }
-      }
-      render(nextState);
-    });
-  }
-
-  const loadButton = document.getElementById('load-google-events');
-  if (loadButton) {
-    loadButton.addEventListener('click', async () => {
-      if (!getIdTokenClaims()) {
-        alert('Sign in to access Google Calendar events.');
-        return;
-      }
-      try {
-        const calendar = await listUpcomingEvents();
-        const nextState = { ...state, calendarEvents: calendar.items || [] };
-        saveState(nextState);
-        render(nextState);
-      } catch (error) {
-        console.error('Unable to load events:', error);
-        alert('Unable to load Google events.');
-      }
-    });
-  }
-}
-
-function attachSettingsEvents(state) {
-  const syncButton = document.getElementById('google-sync');
-  if (syncButton) {
-    syncButton.addEventListener('click', async () => {
-      if (!getIdTokenClaims()) {
-        alert('Please sign in with Google before syncing.');
-        return;
-      }
-      try {
-        const result = await syncRecipesToDrive(state);
-        const nextState = {
-          ...state,
-          recipes: result.recipes,
-          folders: result.folders,
-          driveFolders: result.driveFolders,
-          driveStatus: 'synced'
-        };
-        saveState(nextState);
-        render(nextState);
-      } catch (error) {
-        console.error('Drive sync failed:', error);
-        alert('Unable to sync with Google Drive.');
-      }
-    });
-  }
-}
-
-let state = loadState();
-
-handleRedirectCallback(GOOGLE_CLIENT_ID, REDIRECT_URI)
-  .then(() => {
-    state = loadState();
-    render(state);
-  })
-  .catch((error) => {
-    console.error('Google auth callback failed:', error);
-    render(state);
-  });
-
-render(state);
-
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch(console.error);
-  });
-}
+start();

@@ -1,10 +1,10 @@
 {
-  "name": "Recipe & Meal Planner",
-  "short_name": "RecipeApp",
+  "name": "YARA — Your Adaptable Recipe Archive",
+  "short_name": "YARA",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",
   "background_color": "#f4f7fb",
-  "theme_color": "#2f6fed",
+  "theme_color": "#29423a",
   "icons": []
 }
